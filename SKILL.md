@@ -1,55 +1,39 @@
 ---
 name: relai
-description: "Browse and call paid APIs on the RelAI marketplace (relai.fi) using x402 micropayments. Delegates wallet and payment operations to lobster.cash. Use when: (1) searching for an API to accomplish a task, (2) calling a paid API endpoint, (3) checking available APIs and pricing. NOT for: free/public APIs that don't require payment."
-metadata:
-  {
-    "openclaw":
-      {
-        "emoji": "🔌",
-        "primaryEnv": "RELAI_API_URL"
-      }
-  }
+version: 1.0.0
+description: "Browse and call paid APIs on the RelAI marketplace (relai.fi) using x402 micropayments. Delegates wallet and payment operations to lobster.cash. Use when: searching for an API, calling a paid endpoint, or checking pricing. NOT for: free/public APIs."
+metadata: {"openclaw": {"emoji": "🔌", "primaryEnv": "RELAI_API_URL", "requires": {"env": ["RELAI_API_URL"], "bins": ["curl", "jq"]}}}
 ---
 
 # RelAI — x402 Paid API Client
 
-Call any paid API on the RelAI marketplace. This skill handles API discovery and the x402 payment protocol orchestration. Transaction execution and final status are handled by lobster.cash.
+Call paid APIs on the RelAI marketplace. Handles API discovery and x402 payment protocol. Wallet operations are delegated to lobster.cash.
 
-## Wallet Compatibility
+## Inputs needed
 
-- **Tested wallet**: lobster.cash
-- If wallet context is missing, complete lobster.cash setup first before proceeding
+- `RELAI_API_URL` environment variable (e.g. `https://api.relai.fi`)
+- A configured lobster.cash wallet with USDC balance on Solana
 
-## Environment
+## Workflow
 
-- `RELAI_API_URL` — RelAI server base URL (`https://api.relai.fi`)
+### Step 0 — Validate prerequisites
 
-## When to Use
+1) Verify `RELAI_API_URL` is set. If not, stop and inform the user.
+2) Verify lobster.cash wallet is configured. If not, ask the user to set up lobster.cash first.
 
-- User asks to call a paid API (AI, data, SaaS, etc.)
-- User wants to find an API for a specific task
-- User wants to know pricing for an API endpoint
-- User says "use RelAI", "find an API for…", "call the … API"
+### Step 1 — Discover APIs
 
----
-
-## Step 1 — Discover APIs
-
-List all available APIs:
+See [reference/marketplace-api.md](reference/marketplace-api.md) for full endpoint details.
 
 ```bash
 curl -s "${RELAI_API_URL}/marketplace" | jq '.[] | {apiId, name, description, supportedNetworks, zAuthEnabled}'
 ```
 
-Search by keyword:
+Filter rules — skip and warn the user if any apply:
+- `zAuthEnabled` is `true` (zAuth not supported)
+- `supportedNetworks` does not include `"solana"` (lobster.cash is Solana-only)
 
-```bash
-curl -s "${RELAI_API_URL}/marketplace" | jq '[.[] | select(.name | test("KEYWORD"; "i"))] | .[] | {apiId, name, description, zAuthEnabled}'
-```
-
-**IMPORTANT**: Only use APIs where `zAuthEnabled` is `false`. APIs with `zAuthEnabled: true` require zero-knowledge authentication which is not supported by this skill. Filter them out and warn the user.
-
-## Step 2 — Explore API Endpoints & Pricing
+### Step 2 — Explore endpoints and pricing
 
 ```bash
 curl -s "${RELAI_API_URL}/marketplace/{apiId}" | jq '{
@@ -58,125 +42,47 @@ curl -s "${RELAI_API_URL}/marketplace/{apiId}" | jq '{
 }'
 ```
 
-- `usdPrice` — cost per call in USD
-- `enabled` — must be `true` to call
-- Only endpoints with `enabled: true` have pricing and can be called
+Only endpoints with `enabled: true` and a `usdPrice` can be called.
 
-## Step 3 — Wallet Precheck
+### Step 3 — Wallet precheck
 
-Before any payment:
+1) Check lobster.cash balance.
+2) If balance < endpoint `usdPrice`, inform the user and stop.
+3) Show the user the endpoint name, price, and ask for confirmation before proceeding.
 
-- If a lobster.cash wallet is already configured, use it. Do not create a new one.
-- If no wallet is configured, ask the user to set up lobster.cash first.
-- Verify the wallet has sufficient funds to cover the endpoint's `usdPrice`. If insufficient, inform the user and ask them to fund their wallet.
+### Step 4 — Call the API (x402 payment flow)
 
-## Step 4 — Call the API (x402 Payment Flow)
+See [reference/x402-flow.md](reference/x402-flow.md) for protocol details and header format.
 
-The x402 protocol uses a challenge-response flow. This skill orchestrates the protocol; lobster.cash handles payment execution.
+1) **Get 402 challenge**: `curl` the relay endpoint without payment. Expect HTTP 402.
+2) **Parse**: decode `payment-required` header (base64 JSON). Extract `network`, `amount`, `asset`, `payTo`, `resource.url`. If `network` is not `solana`, stop.
+3) **Pay**: send the required amount to `payTo` via lobster.cash. Wait for on-chain confirmation (timeout: 60s).
+4) **Build X-PAYMENT**: construct header with `txId` from confirmed transaction.
+5) **Retry**: `curl` the `resource.url` with `X-PAYMENT` header. Same request body as step 1.
 
-### 4a — Initial request (get 402 challenge)
+## Output format
 
-Call the relay endpoint without payment. It will return HTTP 402 with payment requirements.
+- **API discovered**: name, apiId, price, network
+- **API response**: raw JSON from the endpoint
+- **Payment summary**: amount paid, transaction hash, wallet balance after
 
-```bash
-curl -s -w "\n---HTTP_STATUS:%{http_code}---" \
-  "${RELAI_API_URL}/relay/{apiId}{endpointPath}" \
-  -X {METHOD} \
-  -H "Accept: application/json" \
-  -H "Content-Type: application/json" \
-  -d '{REQUEST_BODY}'
-```
+## Guardrails
 
-For GET requests, omit `-d`.
+- Never call a paid endpoint without confirming the price with the user first.
+- Never fabricate API responses or transaction hashes.
+- Never create a new wallet if one already exists.
+- Do not retry a failed payment automatically — show the error and let the user decide.
+- Do not call APIs with `zAuthEnabled: true` or non-Solana networks.
 
-### 4b — Parse the 402 response
-
-The 402 response includes a `payment-required` header (base64-encoded JSON). Decode and extract:
-
-- `accepts[0].network` — payment network
-- `accepts[0].amount` — amount in token atomic units
-- `accepts[0].asset` — token address
-- `accepts[0].payTo` — recipient address
-- `accepts[0].extra` — additional parameters
-- `resource.url` — the URL to call with payment attached
-
-Convert the atomic amount to human-readable (e.g. 10000 atomic USDC = 0.01 USDC, since USDC has 6 decimals).
-
-### 4c — Pay via lobster.cash
-
-Delegate payment to lobster.cash: send the required amount to the `payTo` address. Wait for on-chain confirmation. The confirmed transaction hash is needed for the next step.
-
-### 4d — Build the X-PAYMENT header
-
-Once payment is confirmed, construct the payment proof header using the transaction hash:
-
-```bash
-PAYMENT_HEADER=$(echo -n '{
-  "x402Version": 2,
-  "accepted": {
-    "scheme": "exact",
-    "network": "{NETWORK}",
-    "amount": "{AMOUNT}",
-    "payTo": "{PAY_TO}",
-    "asset": "{ASSET}"
-  },
-  "payload": {
-    "txId": "{TX_HASH}"
-  }
-}' | base64 -w 0)
-```
-
-Replace placeholders with values from the 402 response and the confirmed transaction hash from lobster.cash.
-
-### 4e — Retry with payment
-
-```bash
-curl -s "${RESOURCE_URL}" \
-  -X {METHOD} \
-  -H "X-PAYMENT: ${PAYMENT_HEADER}" \
-  -H "Content-Type: application/json" \
-  -d '{REQUEST_BODY}'
-```
-
-Use `resource.url` from the 402 response. The request body must be identical to step 4a. The facilitator verifies the on-chain payment and returns the API response.
-
----
-
-## Alternative: Pre-fetch pricing without calling
-
-```bash
-curl -s "${RELAI_API_URL}/marketplace/{apiId}/x402?method={METHOD}&path={PATH}" | jq '.'
-```
-
-## Error Handling
+## Error handling
 
 | Situation | Action |
 |---|---|
-| Wallet not configured | Ask user to complete lobster.cash setup first |
-| Insufficient balance | Show required amount, ask user to fund wallet |
-| `zAuthEnabled: true` | Inform user this API requires zAuth (not supported) |
-| Payment failed | Display error from lobster.cash, suggest retry |
-| Awaiting confirmation | Wait for lobster.cash to report final status before continuing |
-| API returned 4xx/5xx after payment | Upstream API error — show the error to the user |
-
-## Full Example
-
-```
-User: "Check the NovaShield health endpoint"
-
-1. Discover: find NovaShield (zAuthEnabled: false) ✓
-2. Explore: GET /v1/health, $0.01/call, Solana
-3. Wallet precheck: lobster.cash configured, 9.95 USDC, sufficient
-4a. curl relay → HTTP 402 with payment-required header
-4b. Parse: 10000 atomic = 0.01 USDC, payTo=DnoU...Mh1, network=solana
-4c. Pay via lobster.cash: send 0.01 USDC to payTo, wait for confirmation → tx hash
-4d. Build X-PAYMENT header with txId = confirmed hash
-4e. curl with X-PAYMENT → {"status":"healthy","service":"NovaShield Security Engine"}
-```
-
-## Notes
-
-- This skill delegates wallet operations to lobster.cash
-- This skill owns: API discovery, x402 protocol orchestration, request/response handling
-- lobster.cash owns: wallet provisioning, transaction signing/approval/broadcast, transaction state
-- The relay URL pattern is `${RELAI_API_URL}/relay/{apiId}{endpointPath}`
+| `RELAI_API_URL` not set | Stop, tell user to configure it |
+| Wallet not configured | Stop, ask user to set up lobster.cash |
+| Insufficient balance | Show required amount, stop |
+| `zAuthEnabled: true` | Inform user, skip this API |
+| Non-Solana network | Inform user, skip (lobster.cash is Solana-only) |
+| Non-402 response | Show the response and status code |
+| Payment failed or timed out | Show error from lobster.cash, stop |
+| API returned 4xx/5xx after payment | Show the raw error response |
